@@ -2,36 +2,106 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Routes
-const authRoutes = require('./routes/auth');
-const syncRoutes = require('./routes/sync');
+// --- DATABASE MODELS ---
+const userSchema = new mongoose.Schema({
+  companyName: { type: String, required: true, unique: true, trim: true },
+  password: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const User = mongoose.model('User', userSchema);
 
-app.use('/api/auth', authRoutes);
-app.use('/api/sync', syncRoutes);
+const companyDataSchema = new mongoose.Schema({
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', unique: true },
+  payload: mongoose.Schema.Types.Mixed,
+  lastUpdated: { type: Date, default: Date.now }
+}, { strict: false });
+const CompanyData = mongoose.model('CompanyData', companyDataSchema);
 
-app.get('/', (req, res) => {
-  res.send('MTC ERP API is running...');
+// --- AUTHENTICATION ROUTES ---
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { companyName, password } = req.body;
+    let user = await User.findOne({ companyName });
+    if (user) return res.status(400).json({ message: 'Η εταιρεία υπάρχει ήδη' });
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    user = new User({ companyName, password: hashedPassword });
+    await user.save();
+
+    const token = jwt.sign({ user: { id: user.id } }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, companyName });
+  } catch (err) {
+    res.status(500).send('Server error');
+  }
 });
 
-// Database Connection
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { companyName, password } = req.body;
+    const user = await User.findOne({ companyName });
+    if (!user) return res.status(400).json({ message: 'Λάθος στοιχεία σύνδεσης' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: 'Λάθος στοιχεία σύνδεσης' });
+
+    const token = jwt.sign({ user: { id: user.id } }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, companyName });
+  } catch (err) {
+    res.status(500).send('Server error');
+  }
+});
+
+// --- SYNC ROUTES ---
+const authMiddleware = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ message: 'No token, authorization denied' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded.user;
+    next();
+  } catch (err) {
+    res.status(401).json({ message: 'Token is not valid' });
+  }
+};
+
+app.post('/api/sync/upload', authMiddleware, async (req, res) => {
+  try {
+    await CompanyData.findOneAndUpdate(
+      { companyId: req.user.id },
+      { payload: req.body.data, lastUpdated: new Date() },
+      { upsert: true }
+    );
+    res.json({ message: 'Συγχρονισμός επιτυχής' });
+  } catch (err) {
+    res.status(500).send('Server error during upload');
+  }
+});
+
+app.get('/api/sync/download', authMiddleware, async (req, res) => {
+  try {
+    const data = await CompanyData.findOne({ companyId: req.user.id });
+    res.json(data ? data.payload : { projects: [] });
+  } catch (err) {
+    res.status(500).send('Server error during download');
+  }
+});
+
+app.get('/', (req, res) => res.send('MTC ERP API IS LIVE'));
+
+// --- SERVER START ---
 const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI;
-
-if (!MONGODB_URI) {
-  console.error('ERROR: MONGODB_URI is not defined in .env');
-  process.exit(1);
-}
-
-mongoose.connect(MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('Connected to MongoDB');
     app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
-  .catch(err => console.error('MongoDB Connection Error:', err));
+  .catch(err => console.error('Database connection error:', err));
